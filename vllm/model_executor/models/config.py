@@ -624,8 +624,63 @@ class NemotronHForCausalLMConfig(VerifyAndUpdateConfig):
             )
             cache_config.mamba_ssm_cache_dtype = mamba_ssm_cache_dtype
 
+    # NVFP4 checkpoints surface as one of these quantization methods.
+    _NVFP4_QUANT_METHODS = ("modelopt", "modelopt_fp4", "modelopt_mixed", "nvfp4")
+
+    @classmethod
+    def apply_dgx_spark_defaults(cls, vllm_config: "VllmConfig") -> None:
+        """Fold the DGX Spark (GB10 / SM121) NVFP4 tuning into unset flags.
+
+        Reaching good throughput for NemotronH NVFP4 checkpoints on DGX Spark
+        requires a specific set of FlashInfer kernel, Mamba cache and scheduling
+        choices that vLLM does not pick automatically. This applies them as
+        defaults on Spark, only touching flags the user left at their default so
+        an explicit CLI value always wins. Env-var-driven backends
+        (``VLLM_*``/``CUTE_DSL_ARCH``) and workload-capacity limits
+        (``--max-model-len``, ``--max-num-seqs``, ``--gpu-memory-utilization``)
+        are intentionally left to the user.
+        """
+        from vllm.config.mamba import MambaBackendEnum
+        from vllm.platforms import current_platform
+
+        # SM121 is GB10, i.e. exactly DGX Spark (SM120 is RTX 50-series).
+        if not current_platform.is_device_capability((12, 1)):
+            return
+
+        quant = vllm_config.model_config.quantization
+        if quant is None or quant not in cls._NVFP4_QUANT_METHODS:
+            return
+
+        def fold(obj: object, attr: str, unset: object, value: object) -> None:
+            if getattr(obj, attr) == unset:
+                setattr(obj, attr, value)
+                logger.info("DGX Spark NemotronH default: setting %s=%r", attr, value)
+
+        cache_config = vllm_config.cache_config
+        mamba_config = vllm_config.mamba_config
+        kernel_config = vllm_config.kernel_config
+        scheduler_config = vllm_config.scheduler_config
+        pass_config = vllm_config.compilation_config.pass_config
+
+        fold(cache_config, "mamba_ssm_cache_dtype", "auto", "float16")
+        fold(
+            mamba_config,
+            "backend",
+            MambaBackendEnum.TRITON,
+            MambaBackendEnum.FLASHINFER,
+        )
+        fold(mamba_config, "enable_stochastic_rounding", False, True)
+        fold(mamba_config, "stochastic_rounding_philox_rounds", 0, 5)
+        fold(scheduler_config, "async_scheduling", None, True)
+        fold(kernel_config, "moe_backend", "auto", "flashinfer_b12x")
+        fold(kernel_config, "linear_backend", "auto", "flashinfer_cutlass")
+        fold(kernel_config, "enable_flashinfer_autotune", None, True)
+        fold(pass_config, "fuse_norm_quant", None, True)
+        fold(pass_config, "fuse_act_quant", None, True)
+
     @classmethod
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        cls.apply_dgx_spark_defaults(vllm_config)
         cls.update_mamba_ssm_cache_dtype(
             cache_config=vllm_config.cache_config,
             hf_config=vllm_config.model_config.hf_config,
